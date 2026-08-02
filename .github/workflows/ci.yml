@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Новый пуш в ту же ветку отменяет предыдущий незавершённый прогон.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  lint:
+    name: Линтер
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.6.1
+          args: --timeout=5m
+
+      - name: Проверка форматирования
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Файлы не отформатированы:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy не меняет go.mod/go.sum
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  test:
+    name: Тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Unit-тесты
+        run: go test -race -count=1 ./...
+
+      # На ubuntu-latest доступен Docker, поэтому testcontainers поднимает
+      # настоящий PostgreSQL - агрегирующие запросы и ограничения БД
+      # проверяются на том же движке, что и в проде.
+      - name: Интеграционные тесты и покрытие
+        run: |
+          go test -race -count=1 -tags=integration \
+            -coverpkg=./internal/... -coverprofile=coverage.out -covermode=atomic \
+            ./internal/...
+
+      - name: Отчёт о покрытии
+        run: go tool cover -func=coverage.out | tail -n 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  openapi:
+    name: OpenAPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Валидация спецификации
+        run: npx --yes @redocly/cli@latest lint --config .redocly.yaml api/openapi.yaml
+
+  docker:
+    name: Сборка образа и запуск стека
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Сборка образа
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: finance-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Проверяем не только то, что образ собирается, но и то, что весь стек
+      # поднимается из чистого состояния и отвечает на запросы: цепочка
+      # postgres -> migrator -> api должна отработать без ручных шагов.
+      - name: Запуск стека
+        run: docker compose up -d --wait --wait-timeout 120
+
+      - name: Проверка работоспособности
+        run: |
+          set -euo pipefail
+          user="11111111-1111-4111-8111-111111111111"
+
+          curl -fsS localhost:8080/healthz
+
+          curl -fsS -X POST localhost:8080/api/v1/categories \
+            -H "X-User-Id: $user" -H 'Content-Type: application/json' \
+            -d '{"name":"Продукты"}'
+
+          curl -fsS -X POST localhost:8080/api/v1/operations \
+            -H "X-User-Id: $user" -H 'Content-Type: application/json' \
+            -d '{"category_id":1,"type":"expense","amount":150000,"occurred_at":"2026-07-15T18:32:00Z"}'
+
+          stats=$(curl -fsS "localhost:8080/api/v1/stats?from=2026-07-01&to=2026-07-31" \
+            -H "X-User-Id: $user")
+          echo "$stats"
+          echo "$stats" | grep -q '"total_expense":150000'
+
+      - name: Логи при падении
+        if: failure()
+        run: docker compose logs
+
+      - name: Остановка стека
+        if: always()
+        run: docker compose down -v

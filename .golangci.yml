@@ -1,0 +1,120 @@
+version: "2"
+
+run:
+  timeout: 5m
+  # Файлы под тегом integration тоже должны проверяться линтером.
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+
+  enable:
+    # Корректность
+    - bodyclose        # незакрытое тело HTTP-ответа
+    - rowserrcheck     # незамеченная ошибка при переборе строк из БД
+    - sqlclosecheck    # незакрытые sql.Rows / sql.Stmt
+    - errorlint        # сравнение ошибок без errors.Is/As
+    - noctx            # HTTP-запрос без context
+    - nilerr           # return nil при ненулевой ошибке
+    - contextcheck     # потерянный context между вызовами
+
+    # Безопасность
+    - gosec
+
+    # Читаемость и стиль
+    - revive
+    - misspell
+    - unconvert        # бессмысленные преобразования типов
+    - wastedassign
+    - godot            # комментарии-предложения заканчиваются точкой
+    - predeclared      # затенение предопределённых имён (len, cap, ...)
+
+    # Архитектура
+    - depguard         # контроль направления зависимостей между слоями
+
+  settings:
+    depguard:
+      rules:
+        # Доменный слой не должен знать ни о HTTP, ни о SQL, ни о конкретном драйвере БД
+        domain:
+          files:
+            - "**/internal/domain/*.go"
+            # Тесты живут во внешнем пакете domain_test и законно импортируют и сам домен, и testify
+            - "!**/internal/domain/*_test.go"
+          allow:
+            - $gostd
+            - github.com/google/uuid
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: доменный слой не должен зависеть от драйвера БД
+            - pkg: github.com/go-chi/chi
+              desc: доменный слой не должен зависеть от HTTP-роутера
+            - pkg: finance-api/internal/repository
+              desc: зависимости направлены к домену, а не от него
+            - pkg: finance-api/internal/transport
+              desc: зависимости направлены к домену, а не от него
+
+        # Сервисный слой оперирует доменом и интерфейсами репозиториев, но ничего не знает об HTTP и хранилище
+        service:
+          files:
+            - "**/internal/service/*.go"
+            - "!**/internal/service/*_test.go"
+          allow:
+            - $gostd
+            - github.com/google/uuid
+            - finance-api/internal/domain
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: сервис работает с интерфейсом репозитория, а не с драйвером БД
+            - pkg: net/http
+              desc: сервисный слой не должен зависеть от транспорта
+            - pkg: finance-api/internal/repository
+              desc: сервис зависит от собственных интерфейсов, а не от реализации
+
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: package-comments
+          disabled: false
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    gosec:
+      excludes:
+        # Целочисленные преобразования проверяются валидацией домена
+        - G115
+
+    errcheck:
+      # Явно игнорируемые через _ = ... вызовы не считаются ошибкой:
+      # так отмечаем сознательные решения (закрытие соединения в defer, запись в уже отправленный ответ).
+      check-blank: false
+
+    misspell:
+      locale: US
+
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - godot
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  settings:
+    goimports:
+      # Импорты проекта идут отдельной группой после сторонних
+      local-prefixes:
+        - finance-api
