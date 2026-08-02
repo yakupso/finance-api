@@ -146,18 +146,18 @@ curl -s -X POST localhost:8080/api/v1/operations \
   -d '{"category_id":1,"type":"expense","amount":320000,"comment":"магазин"}'
 ```
 
-Получить расходы за июль:
+Получить расходы за август:
 
 ```bash
 curl -s -H "X-User-Id: $USER_ID" \
-  "localhost:8080/api/v1/operations?from=2026-07-01&to=2026-07-31&type=expense"
+  "localhost:8080/api/v1/operations?from=2026-08-01&to=2026-08-31&type=expense"
 ```
 
 Получить статистику:
 
 ```bash
 curl -s -H "X-User-Id: $USER_ID" \
-  "localhost:8080/api/v1/stats?from=2026-07-01&to=2026-07-31"
+  "localhost:8080/api/v1/stats?from=2026-08-01&to=2026-08-31"
 ```
 
 Ответ статистики содержит общий доход, общий расход, баланс и расходы по категориям.
