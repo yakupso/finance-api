@@ -1,0 +1,664 @@
+openapi: 3.0.3
+
+info:
+  title: Finance API
+  version: 1.0.0
+  description: |
+    HTTP API для учёта личных доходов и расходов и получения агрегированной
+    статистики.
+
+    ## Идентификация пользователя
+
+    Аутентификация не реализуется. Принадлежность данных определяется
+    заголовком `X-User-Id`, который обязателен во всех запросах к `/api/v1`.
+    Значение - UUID; нулевой UUID отвергается.
+
+    ## Денежные суммы
+
+    Все суммы - целые числа в **минорных единицах** (копейках):
+    `150000` означает 1500.00. Валюта одна, поле валюты отсутствует.
+    Сумма операции всегда положительна - направление движения денег
+    несёт поле `type`.
+
+    ## Границы периода
+
+    Параметры `from` и `to` принимают либо дату `YYYY-MM-DD`, либо метку
+    времени RFC 3339. **Обе границы включающие.**
+
+    Дата без времени в `to` разворачивается до конца суток, поэтому
+    `to=2026-07-31` включает операции, совершённые 31 июля. Дата без времени
+    трактуется в UTC; для другого часового пояса передавайте RFC 3339
+    с явным смещением.
+
+    Ответ `/stats` возвращает фактически применённые границы в поле `period`.
+
+    ## Коды ответа
+
+    Разделение `400` и `422` подчинено одному правилу:
+
+    * `400` - с запросом что-то не так как с запросом: битый JSON,
+      некорректный заголовок, неразбираемые query-параметры;
+    * `422` - тело запроса разобрано успешно, но нарушает бизнес-правила.
+
+    ## Что не поддерживается
+
+    Пагинация, сортировка по произвольному полю, мультивалютность,
+    регулярные платежи - вне объёма задания.
+
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск через docker compose
+
+tags:
+  - name: categories
+    description: Категории финансовых операций
+  - name: operations
+    description: Финансовые операции
+  - name: stats
+    description: Агрегированная статистика
+  - name: health
+    description: Проверка состояния сервиса
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Проба живости
+      description: |
+        Отвечает, пока процесс способен обслуживать запросы.
+        Состояние базы данных намеренно не проверяется - это задача
+        readiness-пробы, которая в объём задания не входит.
+        Заголовок `X-User-Id` не требуется.
+      operationId: health
+      responses:
+        "200":
+          description: Сервис работает
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/v1/categories:
+    post:
+      tags: [categories]
+      summary: Создать категорию
+      description: |
+        Название нормализуется: окружающие пробелы обрезаются, внутренние
+        последовательности пробелов схлопываются в один.
+
+        Название уникально в пределах пользователя и сравнивается
+        без учёта регистра: «Продукты» и «продукты» - одна категория.
+      operationId: createCategory
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCategoryRequest"
+            examples:
+              default:
+                value: { name: "Продукты" }
+      responses:
+        "201":
+          description: Категория создана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/CategoryConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    get:
+      tags: [categories]
+      summary: Список категорий пользователя
+      description: Категории отсортированы по названию.
+      operationId: listCategories
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: Список категорий
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [categories]
+                properties:
+                  categories:
+                    type: array
+                    items: { $ref: "#/components/schemas/Category" }
+              examples:
+                default:
+                  value:
+                    categories:
+                      - { id: 3, name: "Аренда", created_at: "2026-07-01T10:00:00Z" }
+                      - { id: 1, name: "Зарплата", created_at: "2026-07-01T10:00:00Z" }
+                empty:
+                  summary: У пользователя нет категорий
+                  value: { categories: [] }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/operations:
+    post:
+      tags: [operations]
+      summary: Зафиксировать финансовую операцию
+      description: |
+        Категория обязана принадлежать тому же пользователю. Это гарантирует
+        составной внешний ключ в базе данных; при нарушении возвращается `422`
+        с кодом `category_not_found`. Несуществующая и чужая категория
+        неразличимы намеренно: иначе перебором можно было бы узнавать
+        о существовании чужих категорий.
+
+        Если `occurred_at` не передан, подставляется текущее время сервера.
+      operationId: createOperation
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOperationRequest"
+            examples:
+              expense:
+                summary: Расход с датой и комментарием
+                value:
+                  category_id: 2
+                  type: expense
+                  amount: 150000
+                  occurred_at: "2026-07-15T18:32:00Z"
+                  comment: "Пятёрочка"
+              income:
+                summary: Доход без даты - будет проставлено текущее время
+                value:
+                  category_id: 1
+                  type: income
+                  amount: 20000000
+      responses:
+        "201":
+          description: Операция создана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/OperationValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    get:
+      tags: [operations]
+      summary: Список операций пользователя
+      description: |
+        Все фильтры необязательны и комбинируются по «И».
+        Порядок вывода: `occurred_at` по убыванию, при совпадении - `id`
+        по убыванию. Пагинация не реализуется.
+      operationId: listOperations
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - name: type
+          in: query
+          required: false
+          description: Фильтр по типу операции.
+          schema: { $ref: "#/components/schemas/OperationType" }
+        - name: category_id
+          in: query
+          required: false
+          description: Фильтр по идентификатору категории.
+          schema: { type: integer, format: int64, minimum: 1 }
+          example: 2
+      responses:
+        "200":
+          description: Список операций
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operations]
+                properties:
+                  operations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Operation" }
+              examples:
+                default:
+                  value:
+                    operations:
+                      - id: 101
+                        type: expense
+                        amount: 150000
+                        category: { id: 2, name: "Продукты" }
+                        comment: "Пятёрочка"
+                        occurred_at: "2026-07-15T18:32:00Z"
+                        created_at: "2026-07-15T18:40:11Z"
+                      - id: 102
+                        type: income
+                        amount: 20000000
+                        category: { id: 1, name: "Зарплата" }
+                        occurred_at: "2026-07-01T09:00:00Z"
+                        created_at: "2026-07-01T09:05:00Z"
+                empty:
+                  summary: Под фильтр ничего не подошло
+                  value: { operations: [] }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/stats:
+    get:
+      tags: [stats]
+      summary: Агрегированная статистика за период
+      description: |
+        Обе границы периода обязательны: задание требует агрегировать
+        «за указанный период», поэтому значения по умолчанию не подставляются.
+
+        Вся агрегация выполняется на стороне PostgreSQL одним запросом.
+        Разбивка `expenses_by_category` включает только расходы и только
+        категории, по которым в периоде были операции; порядок - по убыванию
+        суммы, при равенстве - по названию.
+
+        `balance` может быть отрицательным.
+      operationId: getStats
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - name: from
+          in: query
+          required: true
+          description: Начало периода (включительно). Дата или RFC 3339.
+          schema: { type: string }
+          example: "2026-07-01"
+        - name: to
+          in: query
+          required: true
+          description: |
+            Конец периода (включительно). Дата или RFC 3339.
+            Дата без времени разворачивается до конца суток.
+          schema: { type: string }
+          example: "2026-07-31"
+      responses:
+        "200":
+          description: Статистика за период
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+              examples:
+                default:
+                  value:
+                    period:
+                      from: "2026-07-01T00:00:00Z"
+                      to: "2026-07-31T23:59:59.999999Z"
+                    total_income: 20000000
+                    total_expense: 6500000
+                    balance: 13500000
+                    expenses_by_category:
+                      - { category_id: 2, category: "Продукты", amount: 3200000 }
+                      - { category_id: 3, category: "Аренда", amount: 2500000 }
+                      - { category_id: 4, category: "Подписки", amount: 800000 }
+                empty:
+                  summary: В периоде нет операций
+                  value:
+                    period:
+                      from: "2026-01-01T00:00:00Z"
+                      to: "2026-01-31T23:59:59.999999Z"
+                    total_income: 0
+                    total_expense: 0
+                    balance: 0
+                    expenses_by_category: []
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  parameters:
+    UserId:
+      name: X-User-Id
+      in: header
+      required: true
+      description: |
+        Идентификатор пользователя (UUID). Обязателен во всех запросах
+        к `/api/v1`. Нулевой UUID отвергается.
+      schema:
+        type: string
+        format: uuid
+      example: "11111111-1111-4111-8111-111111111111"
+
+    From:
+      name: from
+      in: query
+      required: false
+      description: |
+        Начало периода (включительно). Дата `YYYY-MM-DD` или метка времени
+        RFC 3339. Дата без времени трактуется как начало суток в UTC.
+      schema: { type: string }
+      example: "2026-07-01"
+
+    To:
+      name: to
+      in: query
+      required: false
+      description: |
+        Конец периода (включительно). Дата `YYYY-MM-DD` или метка времени
+        RFC 3339. Дата без времени разворачивается до конца суток в UTC,
+        поэтому `to=2026-07-31` включает операции, совершённые 31 июля.
+      schema: { type: string }
+      example: "2026-07-31"
+
+  schemas:
+    OperationType:
+      type: string
+      description: Направление движения денег.
+      enum: [income, expense]
+      example: expense
+
+    Amount:
+      type: integer
+      format: int64
+      description: |
+        Сумма в минорных единицах (копейках). `150000` означает 1500.00.
+        Всегда положительна: знак операции несёт поле `type`.
+      minimum: 1
+      maximum: 99999999999999
+      example: 150000
+
+    CreateCategoryRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: |
+            Название категории. Нормализуется перед сохранением;
+            длина проверяется в символах, а не в байтах.
+          minLength: 1
+          maxLength: 100
+          example: "Продукты"
+
+    Category:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: integer, format: int64, example: 2 }
+        name: { type: string, example: "Продукты" }
+        created_at:
+          type: string
+          format: date-time
+          description: Время создания записи в UTC.
+          example: "2026-07-01T10:00:00Z"
+
+    CategoryRef:
+      type: object
+      description: Категория в составе операции.
+      required: [id, name]
+      properties:
+        id: { type: integer, format: int64, example: 2 }
+        name: { type: string, example: "Продукты" }
+
+    CreateOperationRequest:
+      type: object
+      required: [category_id, type, amount]
+      additionalProperties: false
+      description: |
+        Неизвестные поля отвергаются с кодом `400`: опечатка в имени поля
+        иначе была бы молча проигнорирована.
+      properties:
+        category_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Категория, принадлежащая тому же пользователю.
+          example: 2
+        type: { $ref: "#/components/schemas/OperationType" }
+        amount: { $ref: "#/components/schemas/Amount" }
+        occurred_at:
+          type: string
+          format: date-time
+          description: |
+            Дата и время операции в формате RFC 3339. Необязательно:
+            при отсутствии подставляется текущее время сервера.
+            Допустимый диапазон - от 2000-01-01 до одного года вперёд.
+          example: "2026-07-15T18:32:00Z"
+        comment:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: |
+            Произвольный комментарий. Пустая строка и строка из пробелов
+            равносильны отсутствию значения.
+          example: "Пятёрочка"
+
+    Operation:
+      type: object
+      required: [id, type, amount, category, occurred_at, created_at]
+      properties:
+        id: { type: integer, format: int64, example: 101 }
+        type: { $ref: "#/components/schemas/OperationType" }
+        amount: { $ref: "#/components/schemas/Amount" }
+        category: { $ref: "#/components/schemas/CategoryRef" }
+        comment:
+          type: string
+          description: Отсутствует в ответе, если комментарий не задан.
+          example: "Пятёрочка"
+        occurred_at:
+          type: string
+          format: date-time
+          description: Дата и время операции в UTC.
+          example: "2026-07-15T18:32:00Z"
+        created_at:
+          type: string
+          format: date-time
+          description: Время создания записи в UTC.
+          example: "2026-07-15T18:40:11Z"
+
+    Stats:
+      type: object
+      required: [period, total_income, total_expense, balance, expenses_by_category]
+      properties:
+        period:
+          type: object
+          description: |
+            Фактически применённые границы после нормализации ввода -
+            клиенту не нужно догадываться, как был истолкован его запрос.
+          required: [from, to]
+          properties:
+            from: { type: string, format: date-time, example: "2026-07-01T00:00:00Z" }
+            to: { type: string, format: date-time, example: "2026-07-31T23:59:59.999999Z" }
+        total_income:
+          type: integer
+          format: int64
+          description: Сумма доходов за период в минорных единицах.
+          example: 20000000
+        total_expense:
+          type: integer
+          format: int64
+          description: Сумма расходов за период в минорных единицах.
+          example: 6500000
+        balance:
+          type: integer
+          format: int64
+          description: |
+            Разница `total_income - total_expense`. Может быть отрицательной.
+            Вычисляется на стороне PostgreSQL.
+          example: 13500000
+        expenses_by_category:
+          type: array
+          description: |
+            Расходы, сгруппированные по категориям, по убыванию суммы.
+            Категории без расходов в периоде не включаются.
+          items:
+            type: object
+            required: [category_id, category, amount]
+            properties:
+              category_id: { type: integer, format: int64, example: 2 }
+              category: { type: string, example: "Продукты" }
+              amount: { type: integer, format: int64, example: 3200000 }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                Стабильный машиночитаемый код ошибки. В отличие от `message`,
+                предназначен для программной обработки и не меняется.
+              enum:
+                - bad_request
+                - missing_user_id
+                - invalid_user_id
+                - invalid_query_param
+                - validation_error
+                - category_not_found
+                - category_already_exists
+                - not_found
+                - method_not_allowed
+                - unsupported_media_type
+                - request_too_large
+                - internal_error
+            message:
+              type: string
+              description: Человекочитаемое описание. Может меняться между версиями.
+            details:
+              type: array
+              description: |
+                Перечень нарушений по полям. Присутствует у ошибок валидации:
+                клиент узнаёт обо всех проблемах за один запрос.
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field: { type: string, example: "amount" }
+                  message: { type: string, example: "must be a positive integer in minor units (kopecks), got -1" }
+
+  responses:
+    BadRequest:
+      description: |
+        Запрос не удалось разобрать: битый JSON, неизвестное поле,
+        отсутствующий или некорректный `X-User-Id`, неверные query-параметры.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            missingUserId:
+              summary: Не передан идентификатор пользователя
+              value:
+                error:
+                  code: missing_user_id
+                  message: "X-User-Id header is required and must contain a UUID"
+            malformedJSON:
+              summary: Битый JSON
+              value:
+                error:
+                  code: bad_request
+                  message: "request body contains malformed JSON at offset 12"
+            badQueryParam:
+              summary: Некорректная граница периода
+              value:
+                error:
+                  code: invalid_query_param
+                  message: "from must be a date (2006-01-02) or an RFC 3339 timestamp (2006-01-02T15:04:05Z), got \"вчера\""
+
+    ValidationFailed:
+      description: Тело запроса разобрано, но нарушает бизнес-правила.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            blankName:
+              value:
+                error:
+                  code: validation_error
+                  message: "request body failed validation"
+                  details:
+                    - field: name
+                      message: "is required and must not be blank"
+
+    OperationValidationFailed:
+      description: |
+        Тело запроса разобрано, но нарушает бизнес-правила либо ссылается
+        на несуществующую или чужую категорию.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            validation:
+              summary: Несколько нарушений сразу
+              value:
+                error:
+                  code: validation_error
+                  message: "request body failed validation"
+                  details:
+                    - field: category_id
+                      message: "is required and must be a positive integer"
+                    - field: type
+                      message: "must be one of [income expense], got \"transfer\""
+                    - field: amount
+                      message: "must be a positive integer in minor units (kopecks), got -1"
+            unknownCategory:
+              summary: Категория не существует или принадлежит другому пользователю
+              value:
+                error:
+                  code: category_not_found
+                  message: "category does not exist or belongs to another user"
+                  details:
+                    - field: category_id
+                      message: "unknown category"
+
+    CategoryConflict:
+      description: У пользователя уже есть категория с таким названием.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: category_already_exists
+              message: "category with this name already exists"
+
+    UnsupportedMediaType:
+      description: Заголовок `Content-Type` отсутствует или отличен от `application/json`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: unsupported_media_type
+              message: "Content-Type must be application/json, got \"text/plain\""
+
+    PayloadTooLarge:
+      description: Тело запроса превышает 1 МиБ.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: request_too_large
+              message: "request body must not exceed 1048576 bytes"
+
+    InternalError:
+      description: |
+        Непредвиденная ошибка. Подробности не раскрываются клиенту
+        и пишутся в лог сервиса.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: internal_error
+              message: "internal server error"

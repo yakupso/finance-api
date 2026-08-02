@@ -1,0 +1,15 @@
+# Конфигурация проверки OpenAPI-спецификации (make openapi-lint).
+
+apis:
+  main:
+    root: api/openapi.yaml
+
+rules:
+  # Аутентификация и авторизация по условиям задания не реализуются
+  security-defined: off
+
+  # Сервис запускается локально через docker compose, и localhost - единственный адрес, по которому он доступен
+  no-server-example.com: off
+
+  info-license: off
+  operation-4xx-response: off
