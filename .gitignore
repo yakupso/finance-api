@@ -1,0 +1,12 @@
+/bin/
+
+.env
+.env.local
+
+*.out
+*.test
+coverage.html
+
+.idea/
+
+.DS_Store
